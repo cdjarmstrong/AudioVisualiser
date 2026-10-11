@@ -9,120 +9,47 @@ import numpy as np
 import pygame
 from proctap import ProcessAudioCapture
 
-
-# Windows application-specific audio capture.
-# No microphone input is used.
-
 SAMPLE_RATE = 48000
 CHANNELS = 2
-
-CHUNK = 512
-ANALYSIS_SIZE = 10240
-
-BARS = 64
-WIDTH = 800
-HEIGHT = 600
-
-BIN_FLOOR = 0.1
-MIN_NORM = 10.0
-FLOOR_OFFSET = 40
-GAIN = 2.0
-SMOOTHING = 0.80
-
 AUDIO_QUEUE_SIZE = 64
 LOG_INTERVAL = 5.0
+PARTICLE_COUNT = 220
+FPS = 60
+
+BLACK = (0, 0, 0)
+GREEN = (0, 255, 75)
+DIM_GREEN = (0, 100, 35)
 
 
-def log_bins(spectrum, bars, sample_rate, chunk_size, bin_floor):
-    freqs = np.fft.rfftfreq(chunk_size, 1.0 / sample_rate)
-
-    min_freq = 40
-    max_freq = min(10000, freqs[-1])
-
-    edges = np.logspace(
-        math.log10(min_freq),
-        math.log10(max_freq),
-        bars + 1,
-    )
-
-    values = []
-
-    for i in range(bars):
-        indices = np.where(
-            (freqs >= edges[i]) & (freqs < edges[i + 1])
-        )[0]
-
-        if len(indices):
-            values.append(
-                max(float(np.mean(spectrum[indices])), bin_floor)
-            )
-        else:
-            values.append(bin_floor)
-
-    return values
-
-
-def draw_visualizer(screen, window_size, heights, bars, floor_offset):
-    width, height = window_size
-    bar_width = max(1, width // bars)
-    floor = height - floor_offset
-
-    screen.fill((0, 0, 0))
-
-    pygame.draw.line(
-        screen,
-        (200, 200, 200),
-        (0, floor),
-        (width, floor),
-        2,
-    )
-
-    for index, bar_height in enumerate(heights):
-        bar_height = min(max(0, bar_height), floor)
-        x = index * bar_width
-        y = max(0, floor - bar_height)
-
-        pygame.draw.rect(
-            screen,
-            (0, 255, 0),
-            (x, y, max(1, bar_width - 2), bar_height),
-        )
-
-    pygame.display.flip()
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 
 def main():
     if platform.system() != "Windows":
-        raise RuntimeError(
-            "This version is intended for Windows 11."
-        )
+        raise RuntimeError("This version is intended for Windows 11.")
 
-    print("Application Audio Visualizer")
-    print("-----------------------------")
-    print("Captures audio from one application.")
-    print("Microphone input is not used.")
-    print()
-    print("Find the application's PID in Task Manager:")
-    print("Task Manager -> Details -> PID")
-    print()
+    print("Audio-reactive particle visualizer")
+    print("Application audio only — no microphone")
+    print("Find the target PID in Task Manager > Details.")
 
     try:
         target_pid = int(input("Enter target application PID: ").strip())
     except ValueError:
-        raise SystemExit("Invalid PID. Please enter a number.")
+        raise SystemExit("Please enter a valid numeric PID.")
 
     if target_pid <= 0:
-        raise SystemExit("PID must be a positive number.")
+        raise SystemExit("PID must be positive.")
 
     audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_SIZE)
-
-    # Shared latest-block diagnostics, updated by the capture callback.
-    latest_audio_info = {"data": None}
     info_lock = threading.Lock()
+    latest_info = {"data": None}
 
     def on_audio(pcm, frames):
+        # This decoder assumes float32 stereo audio.
+        # Verify proc-tap's actual callback format if readings are zero.
         try:
-            # Assumes the installed ProcTap backend supplies float32 PCM.
+            byte_count = len(pcm)
             samples = np.frombuffer(pcm, dtype=np.float32).copy()
 
             usable = (samples.size // CHANNELS) * CHANNELS
@@ -130,20 +57,23 @@ def main():
                 return
 
             samples = samples[:usable].reshape(-1, CHANNELS)
+            peak = float(np.max(np.abs(samples)))
+            rms = float(np.sqrt(np.mean(samples ** 2)))
 
-            # Record details from the most recent captured block.
             info = {
                 "time": time.time(),
-                "frames": len(samples),
-                "peak": float(np.max(np.abs(samples))),
-                "rms": float(np.sqrt(np.mean(samples ** 2))),
-                "first_samples": samples[:5].flatten().tolist(),
+                "callback_frames": frames,
+                "bytes": byte_count,
+                "float_values": int(samples.size),
+                "decoded_frames": int(len(samples)),
+                "peak": peak,
+                "rms": rms,
+                "first_samples": samples.flatten()[:10].tolist(),
             }
 
             with info_lock:
-                latest_audio_info["data"] = info
+                latest_info["data"] = info
 
-            # Send audio to the visualizer without blocking the callback.
             try:
                 audio_queue.put_nowait(samples)
             except queue.Full:
@@ -151,33 +81,58 @@ def main():
                     audio_queue.get_nowait()
                 except queue.Empty:
                     pass
-
                 try:
                     audio_queue.put_nowait(samples)
                 except queue.Full:
                     pass
 
-        except (ValueError, TypeError) as exc:
-            print(f"[AUDIO] Could not decode audio block: {exc}")
+        except (ValueError, TypeError, BufferError) as exc:
+            print(f"[AUDIO] Decode error: {exc}")
 
     pygame.init()
     pygame.display.set_caption(
-        "Arkam's Audio Visualizer - App Audio Only"
+        "Arkam's Audio Visualizer - Application Audio Only"
     )
 
-    window_size = [WIDTH, HEIGHT]
+    display_info = pygame.display.Info()
     screen = pygame.display.set_mode(
-        (WIDTH, HEIGHT), pygame.RESIZABLE
+        (display_info.current_w, display_info.current_h),
+        pygame.FULLSCREEN,
     )
-
-    buffer = np.zeros(ANALYSIS_SIZE, dtype=np.float32)
-    previous_heights = [0] * BARS
-    pending = np.empty((0, CHANNELS), dtype=np.float32)
+    width, height = screen.get_size()
 
     clock = pygame.time.Clock()
-    running = True
-    tap = None
+    font = pygame.font.Font(None, 27)
+    small_font = pygame.font.Font(None, 20)
+
+    rng = np.random.default_rng()
+    cx, cy = width / 2, height / 2
+
+    def new_particle():
+        return {
+            "angle": float(rng.uniform(0, math.tau)),
+            "radius": float(
+                rng.uniform(20, min(width, height) * 0.45)
+            ),
+            "speed": float(rng.uniform(15, 100)),
+            "size": int(rng.choice([1, 1, 1, 2, 2, 3])),
+            "phase": float(rng.uniform(0, math.tau)),
+        }
+
+    particles = [new_particle() for _ in range(PARTICLE_COUNT)]
+
+    # Rolling audio buffer for low-frequency analysis.
+    analysis_size = 4096
+    audio_buffer = np.zeros(analysis_size, dtype=np.float32)
+    pending = np.empty((0, CHANNELS), dtype=np.float32)
+
+    bass_level = 0.0
+    smoothed_bass = 0.0
     last_log_time = time.monotonic()
+    running = True
+    fullscreen = True
+    show_hud = True
+    tap = None
 
     try:
         tap = ProcessAudioCapture(
@@ -186,123 +141,252 @@ def main():
         )
         tap.start()
 
-        print(f"Capturing application PID {target_pid}.")
-        print("Audio diagnostics will print every 5 seconds.")
-        print("Play audio in the target application.")
-        print("Close the visualizer window to stop.")
+        print(f"Capturing application PID {target_pid}")
+        print("F11: fullscreen | H: hide HUD | R: reset | Esc: quit")
 
         while running:
-            now = time.monotonic()
-
-            # Log only the most recently received block every 5 seconds.
-            if now - last_log_time >= LOG_INTERVAL:
-                with info_lock:
-                    info = latest_audio_info["data"]
-
-                if info is None:
-                    print("[AUDIO] No audio data received yet.")
-                else:
-                    age = time.time() - info["time"]
-                    print(
-                        f"[AUDIO] Latest block | "
-                        f"age={age:.2f}s | "
-                        f"frames={info['frames']} | "
-                        f"peak={info['peak']:.5f} | "
-                        f"RMS={info['rms']:.5f} | "
-                        f"first samples={info['first_samples']}"
-                    )
-
-                last_log_time = now
-
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
 
-                elif event.type == pygame.VIDEORESIZE:
-                    window_size[0] = max(200, event.w)
-                    window_size[1] = max(150, event.h)
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        running = False
 
-                    screen = pygame.display.set_mode(
-                        tuple(window_size),
-                        pygame.RESIZABLE,
-                    )
+                    elif event.key == pygame.K_h:
+                        show_hud = not show_hud
 
-            # Transfer queued audio into the analysis buffer.
+                    elif event.key == pygame.K_r:
+                        particles = [
+                            new_particle()
+                            for _ in range(PARTICLE_COUNT)
+                        ]
+
+                    elif event.key == pygame.K_F11:
+                        fullscreen = not fullscreen
+
+                        if fullscreen:
+                            screen = pygame.display.set_mode(
+                                (0, 0), pygame.FULLSCREEN
+                            )
+                        else:
+                            screen = pygame.display.set_mode(
+                                (1000, 700), pygame.RESIZABLE
+                            )
+
+                        width, height = screen.get_size()
+                        cx, cy = width / 2, height / 2
+
+            # Gather callback audio blocks.
             try:
                 while True:
                     block = audio_queue.get_nowait()
-                    pending = np.concatenate((pending, block), axis=0)
+                    pending = np.concatenate(
+                        (pending, block), axis=0
+                    )
             except queue.Empty:
                 pass
 
-            # Analyze audio in fixed-size chunks.
-            while len(pending) >= CHUNK:
-                block = pending[:CHUNK]
-                pending = pending[CHUNK:]
+            # Update the audio analysis buffer.
+            while len(pending) >= 512:
+                block = pending[:512]
+                pending = pending[512:]
 
                 mono = np.mean(block, axis=1)
+                n = len(mono)
 
-                buffer[:-CHUNK] = buffer[CHUNK:]
-                buffer[-CHUNK:] = mono
+                audio_buffer[:-n] = audio_buffer[n:]
+                audio_buffer[-n:] = mono
 
-                window = np.hanning(ANALYSIS_SIZE)
-                windowed = buffer * window
-
-                spectrum = (
-                    np.abs(np.fft.rfft(windowed)) * GAIN
+                windowed = audio_buffer * np.hanning(
+                    analysis_size
                 )
-                spectrum = np.power(spectrum, 0.7)
-
-                values = log_bins(
-                    spectrum,
-                    BARS,
-                    SAMPLE_RATE,
-                    ANALYSIS_SIZE,
-                    BIN_FLOOR,
+                spectrum = np.abs(np.fft.rfft(windowed))
+                frequencies = np.fft.rfftfreq(
+                    analysis_size, d=1.0 / SAMPLE_RATE
                 )
 
-                max_value = max(max(values), MIN_NORM)
+                bass_bins = (
+                    (frequencies >= 40)
+                    & (frequencies <= 250)
+                )
 
-                heights = [
-                    max(
-                        0,
-                        int(
-                            value / max_value
-                            * (window_size[1] - FLOOR_OFFSET)
-                        ),
+                if np.any(bass_bins):
+                    bass_level = float(
+                        np.sqrt(np.mean(spectrum[bass_bins] ** 2))
                     )
-                    for value in values
-                ]
 
-                heights = [
-                    int(
-                        SMOOTHING * old
-                        + (1.0 - SMOOTHING) * new
-                    )
-                    for old, new in zip(previous_heights, heights)
-                ]
+            # Smooth the bass response to avoid jitter.
+            normalised_bass = clamp(bass_level / 35.0, 0.0, 1.0)
+            smoothed_bass = (
+                0.82 * smoothed_bass
+                + 0.18 * normalised_bass
+            )
 
-                previous_heights[:] = heights
+            pulse = 1.0 + 0.22 * smoothed_bass
+            base_radius = min(width, height) * 0.115
+            ring_radius = base_radius * pulse
 
-                draw_visualizer(
+            screen.fill(BLACK)
+
+            # Bass-reactive central rings.
+            pygame.draw.circle(
+                screen,
+                DIM_GREEN,
+                (int(cx), int(cy)),
+                max(2, int(ring_radius)),
+                1,
+            )
+            pygame.draw.circle(
+                screen,
+                GREEN,
+                (int(cx), int(cy)),
+                max(2, int(ring_radius * 0.72)),
+                1,
+            )
+
+            current_time = time.monotonic()
+
+            # Particle field.
+            for particle in particles:
+                particle["radius"] += (
+                    particle["speed"]
+                    * (0.35 + smoothed_bass * 2.4)
+                    / FPS
+                )
+
+                particle["angle"] += math.sin(
+                    particle["phase"] + current_time * 0.5
+                ) * 0.0015
+
+                radius = particle["radius"]
+                angle = particle["angle"]
+
+                x = cx + math.cos(angle) * radius
+                y = cy + math.sin(angle) * radius * 0.72
+
+                if radius > max(width, height) * 0.72:
+                    particle.update(new_particle())
+                    continue
+
+                size = particle["size"]
+                color = (
+                    GREEN
+                    if smoothed_bass > 0.25 and size >= 2
+                    else DIM_GREEN
+                )
+
+                pygame.draw.circle(
                     screen,
-                    window_size,
-                    heights,
-                    BARS,
-                    FLOOR_OFFSET,
+                    color,
+                    (int(x), int(y)),
+                    size,
                 )
 
-            clock.tick(120)
+            # Bright dots orbiting the pulse ring.
+            for i in range(48):
+                angle = (
+                    i / 48.0 * math.tau
+                    + current_time * 0.12
+                )
+                orbit = ring_radius * (
+                    1.08
+                    + 0.04 * math.sin(current_time * 2 + i)
+                )
 
-    except KeyboardInterrupt:
-        pass
+                x = cx + math.cos(angle) * orbit
+                y = cy + math.sin(angle) * orbit * 0.72
+
+                pygame.draw.circle(
+                    screen,
+                    GREEN,
+                    (int(x), int(y)),
+                    2,
+                )
+
+            # Print diagnostics every five seconds.
+            now = time.monotonic()
+
+            if now - last_log_time >= LOG_INTERVAL:
+                with info_lock:
+                    audio_info = latest_info["data"]
+
+                if audio_info is None:
+                    print("[AUDIO] No callback data received.")
+                else:
+                    age = time.time() - audio_info["time"]
+
+                    print(
+                        f"[AUDIO] age={age:.2f}s | "
+                        f"callback frames="
+                        f"{audio_info['callback_frames']} | "
+                        f"bytes={audio_info['bytes']} | "
+                        f"float32 values="
+                        f"{audio_info['float_values']} | "
+                        f"decoded frames="
+                        f"{audio_info['decoded_frames']} | "
+                        f"peak={audio_info['peak']:.6f} | "
+                        f"RMS={audio_info['rms']:.6f} | "
+                        f"samples={audio_info['first_samples']}"
+                    )
+
+                    if (
+                        audio_info["bytes"] > 0
+                        and audio_info["peak"] == 0.0
+                    ):
+                        print(
+                            "[AUDIO] Samples decode as zero. "
+                            "Check proc-tap's PCM format."
+                        )
+
+                last_log_time = now
+
+            # Minimal green HUD.
+            if show_hud:
+                title = font.render(
+                    "ARKAM'S AUDIO VISUALIZER", True, GREEN
+                )
+                subtitle = small_font.render(
+                    f"APPLICATION AUDIO ONLY | PID {target_pid} "
+                    "| NO MICROPHONE",
+                    True,
+                    (170, 190, 170),
+                )
+                controls = small_font.render(
+                    "F11 fullscreen | H hide HUD | "
+                    "R reset particles | Esc quit",
+                    True,
+                    (120, 150, 120),
+                )
+                meter_label = small_font.render(
+                    f"BASS PULSE  {smoothed_bass:.2f}",
+                    True,
+                    GREEN,
+                )
+
+                screen.blit(title, (24, 20))
+                screen.blit(subtitle, (25, 50))
+                screen.blit(controls, (25, height - 34))
+
+                pygame.draw.rect(
+                    screen, (25, 55, 30),
+                    (25, 82, 130, 5)
+                )
+                pygame.draw.rect(
+                    screen, GREEN,
+                    (25, 82, int(130 * smoothed_bass), 5)
+                )
+                screen.blit(meter_label, (25, 94))
+
+            pygame.display.flip()
+            clock.tick(FPS)
 
     finally:
         if tap is not None:
             try:
                 tap.close()
             except Exception as exc:
-                print(f"Audio capture cleanup warning: {exc}")
+                print(f"Capture cleanup warning: {exc}")
 
         pygame.quit()
 
