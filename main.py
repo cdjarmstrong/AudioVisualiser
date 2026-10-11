@@ -1,25 +1,25 @@
 
 # ============================================================
 # AUDIO-REACTIVE PARTICLE VISUALIZER
-# ------------------------------------------------------------
+# ============================================================
 # Features:
 # - Captures audio from one application using proc-tap
 # - No microphone input
 # - Fullscreen on startup
 # - F11: Toggle fullscreen/windowed
 # - H: Toggle HUD
-# - R: Reset visual effects
+# - R: Reset audio analysis and particles
 # - ESC: Quit
 # - Bass-responsive concentric circles
-# - Bass sine ripples affect every circle
-# - Treble-responsive sine wave
-# - Green particles react to bass intensity
-# - Audio diagnostics printed every 5 seconds
+# - Each circle ripples with a traveling sine wave
+# - Treble-responsive sine wave across the screen
+# - Green particles speed up with bass
+# - Diagnostic logging every 5 seconds
 #
-# IMPORTANT:
-# This version assumes proc-tap delivers float32 PCM audio.
-# Confirm the callback format if the diagnostic levels remain
-# at zero despite the target application playing audio.
+# NOTE:
+# The audio callback assumes proc-tap provides float32 PCM.
+# If levels stay at zero while audio plays, verify the actual
+# callback format before changing the sensitivity settings.
 # ============================================================
 
 import math
@@ -37,14 +37,13 @@ from proctap import ProcessAudioCapture
 # CONFIGURATION
 # ============================================================
 
-# Audio settings
+# Audio capture
 SAMPLE_RATE = 48000
 CHANNELS = 2
 AUDIO_QUEUE_SIZE = 64
 
-# Analysis settings
+# FFT analysis
 ANALYSIS_SIZE = 4096
-ANALYSIS_CHUNK = 512
 
 BASS_MIN_HZ = 40
 BASS_MAX_HZ = 250
@@ -52,14 +51,30 @@ BASS_MAX_HZ = 250
 TREBLE_MIN_HZ = 2500
 TREBLE_MAX_HZ = 10000
 
-# Bass response
-BASS_SENSITIVITY = 12.0
-BASS_SMOOTHING = 0.72
+# ------------------------------------------------------------
+# AUDIO SENSITIVITY
+# These values are deliberately much lower than before.
+# ------------------------------------------------------------
 
-# Stronger circle expansion, with compressed input response
+BASS_SENSITIVITY = 0.1
+TREBLE_SENSITIVITY = 0.4
+
+# Smoothing:
+# Higher = slower and smoother response.
+BASS_SMOOTHING = 0.82
+TREBLE_SMOOTHING = 0.78
+
+# Bass response curve:
+# Higher = more compression of strong bass.
+BASS_COMPRESSION = 1.8
+
+# ------------------------------------------------------------
+# VISUAL RESPONSE
+# ------------------------------------------------------------
+
 PULSE_STRENGTH = 1.15
 
-# Ring ripple settings
+# Bass rings
 BASS_RING_COUNT = 6
 BASS_RING_SPACING = 22
 BASS_RING_BASE_RADIUS = 45
@@ -68,26 +83,23 @@ BASS_RING_WAVE_AMOUNT = 16.0
 BASS_RING_WAVE_SPEED = 2.8
 BASS_RING_WAVE_CYCLES = 3.0
 
-# Treble response
-TREBLE_SENSITIVITY = 22.0
-TREBLE_SMOOTHING = 0.55
-
+# Treble wave
 WAVE_AMPLITUDE = 145
 WAVE_FREQUENCY = 2.5
 WAVE_SPEED = 4.0
 
-# Particle settings
+# Particles
 PARTICLE_COUNT = 220
 PARTICLE_BASS_SPEED = 7.0
 
-# Display settings
+# Display
 FPS = 60
 BACKGROUND_COLOR = (2, 6, 5)
 GREEN = (0, 255, 100)
 DIM_GREEN = (0, 100, 45)
 WHITE = (210, 255, 225)
 
-# Diagnostic logging interval
+# Logging
 LOG_INTERVAL = 5.0
 
 
@@ -107,7 +119,9 @@ logger = logging.getLogger("AudioVisualiser")
 # AUDIO QUEUE AND DIAGNOSTICS
 # ============================================================
 
-audio_queue = queue.Queue(maxsize=AUDIO_QUEUE_SIZE)
+audio_queue = queue.Queue(
+    maxsize=AUDIO_QUEUE_SIZE
+)
 
 audio_diagnostics = {
     "callbacks": 0,
@@ -121,13 +135,10 @@ audio_diagnostics = {
 
 def on_audio(pcm, frames):
     """
-    proc-tap audio callback.
+    Receive audio from proc-tap.
 
-    This callback copies the incoming PCM data into a queue so
-    the audio-capture thread does not perform FFT calculations
-    or drawing operations.
-
-    Assumption: incoming PCM data is float32.
+    The callback copies incoming data into a queue so the
+    capture thread doesn't need to run FFT calculations.
     """
 
     try:
@@ -135,13 +146,13 @@ def on_audio(pcm, frames):
         audio_diagnostics["callback_frames"] = frames
         audio_diagnostics["callback_bytes"] = len(pcm)
 
-        # Decode the incoming PCM buffer as float32.
+        # Assumption: proc-tap returns float32 PCM samples.
         samples = np.frombuffer(
             pcm,
             dtype=np.float32,
         ).copy()
 
-        # Convert stereo data into a single mono signal for FFT.
+        # Convert stereo audio to mono for analysis.
         if CHANNELS > 1:
             usable_length = (
                 len(samples) // CHANNELS
@@ -155,19 +166,23 @@ def on_audio(pcm, frames):
                     CHANNELS,
                 ).mean(axis=1)
 
-        # Collect useful diagnostics.
+        # Diagnostics help identify silent or incorrectly
+        # decoded audio.
         if len(samples) > 0:
-            peak = float(np.max(np.abs(samples)))
-            rms = float(np.sqrt(np.mean(samples ** 2)))
+            audio_diagnostics["last_peak"] = float(
+                np.max(np.abs(samples))
+            )
 
-            audio_diagnostics["last_peak"] = peak
-            audio_diagnostics["last_rms"] = rms
+            audio_diagnostics["last_rms"] = float(
+                np.sqrt(np.mean(samples ** 2))
+            )
 
-        # Queue the samples without blocking the callback.
+        # Add the audio block without blocking capture.
         try:
             audio_queue.put_nowait(samples)
+
         except queue.Full:
-            # Drop the oldest audio block to avoid stale audio.
+            # Drop the oldest block if the queue is full.
             try:
                 audio_queue.get_nowait()
             except queue.Empty:
@@ -180,7 +195,10 @@ def on_audio(pcm, frames):
 
     except Exception as exc:
         audio_diagnostics["last_error"] = str(exc)
-        logger.exception("Error in audio callback")
+
+        logger.exception(
+            "Error in audio callback"
+        )
 
 
 # ============================================================
@@ -189,8 +207,8 @@ def on_audio(pcm, frames):
 
 class AudioAnalyzer:
     """
-    Maintains a rolling audio buffer and calculates bass/treble
-    energy using an FFT.
+    Maintains a rolling audio buffer and extracts bass and
+    treble energy using an FFT.
     """
 
     def __init__(self):
@@ -226,33 +244,36 @@ class AudioAnalyzer:
 
     def update(self):
         """
-        Consume available queued audio blocks, then update
-        the frequency analysis.
+        Read queued samples and update the audio levels.
         """
 
-        new_samples = []
+        new_blocks = []
 
         while True:
             try:
                 block = audio_queue.get_nowait()
-                if len(block):
-                    new_samples.append(block)
+
+                if len(block) > 0:
+                    new_blocks.append(block)
+
             except queue.Empty:
                 break
 
-        if new_samples:
-            incoming = np.concatenate(new_samples)
+        if new_blocks:
+            incoming = np.concatenate(
+                new_blocks
+            )
 
             if len(incoming) >= ANALYSIS_SIZE:
                 self.buffer[:] = incoming[-ANALYSIS_SIZE:]
+
             else:
                 shift = len(incoming)
 
                 self.buffer[:-shift] = self.buffer[shift:]
                 self.buffer[-shift:] = incoming
 
-        # If no audio is arriving, the previous buffer is retained.
-        # A truly silent input will naturally produce near-zero FFT.
+        # Window the signal to reduce FFT edge effects.
         windowed = self.buffer * self.window
 
         spectrum = np.abs(
@@ -262,45 +283,68 @@ class AudioAnalyzer:
         if len(spectrum) == 0:
             return
 
-        # Mean energy within each frequency range.
+        # Calculate mean energy in each frequency range.
         if np.any(self.bass_mask):
             self.raw_bass = float(
-                np.mean(spectrum[self.bass_mask])
+                np.mean(
+                    spectrum[self.bass_mask]
+                )
             )
         else:
             self.raw_bass = 0.0
 
         if np.any(self.treble_mask):
             self.raw_treble = float(
-                np.mean(spectrum[self.treble_mask])
+                np.mean(
+                    spectrum[self.treble_mask]
+                )
             )
         else:
             self.raw_treble = 0.0
 
-        # Scale FFT values into more useful ranges.
-        bass_scaled = min(
-            1.0,
-            self.raw_bass * BASS_SENSITIVITY,
+        # ----------------------------------------------------
+        # DAMPENED AUDIO RESPONSE
+        # ----------------------------------------------------
+        #
+        # Unlike clipping amplified audio immediately at 1.0,
+        # the exponential curve gives a gradual response.
+        # Lower sensitivity means more headroom.
+        # ----------------------------------------------------
+
+        bass_scaled = (
+            self.raw_bass * BASS_SENSITIVITY
         )
 
-        treble_scaled = min(
-            1.0,
-            self.raw_treble * TREBLE_SENSITIVITY,
+        treble_scaled = (
+            self.raw_treble * TREBLE_SENSITIVITY
         )
 
-        # Compress bass response so normal bass doesn't
-        # immediately reach full intensity.
-        bass_target = bass_scaled ** 1.8
+        # Gradually approach maximum instead of abruptly
+        # clipping the raw scaled values.
+        bass_target = (
+            1.0 - math.exp(-bass_scaled)
+        )
 
-        # Smooth the response.
+        treble_target = (
+            1.0 - math.exp(-treble_scaled)
+        )
+
+        # Additional bass compression.
+        bass_target = (
+            bass_target ** BASS_COMPRESSION
+        )
+
+        # Smooth bass transitions.
         self.bass += (
             bass_target - self.bass
         ) * (1.0 - BASS_SMOOTHING)
 
+        # Smooth treble transitions.
         self.treble += (
-            treble_scaled - self.treble
+            treble_target - self.treble
         ) * (1.0 - TREBLE_SMOOTHING)
 
+        # Ensure levels remain within valid bounds.
         self.bass = float(
             np.clip(self.bass, 0.0, 1.0)
         )
@@ -310,7 +354,7 @@ class AudioAnalyzer:
         )
 
     def reset(self):
-        """Clear the audio analysis state."""
+        """Reset the analyzer to silence."""
 
         self.buffer.fill(0.0)
 
@@ -326,16 +370,15 @@ class AudioAnalyzer:
 # ============================================================
 
 class Particle:
-    """
-    A green particle that moves around the center and is
-    influenced by the current bass level.
-    """
+    """Green particle with bass-dependent movement."""
 
     def __init__(self, width, height):
         self.width = width
         self.height = height
 
-        self.reset(random_position=True)
+        self.reset(
+            random_position=True
+        )
 
     def reset(self, random_position=False):
         self.angle = np.random.uniform(
@@ -353,11 +396,12 @@ class Particle:
             0.8,
         )
 
-        self.size = np.random.randint(1, 4)
+        self.size = int(
+            np.random.randint(1, 4)
+        )
 
-        self.alpha = np.random.randint(
-            90,
-            256,
+        self.alpha = int(
+            np.random.randint(90, 256)
         )
 
         if random_position:
@@ -367,17 +411,20 @@ class Particle:
             )
 
     def update(self, bass_level, dt):
-        # Bass increases the outward movement speed.
+        # The bass level increases particle speed.
         movement = (
             self.base_speed
             + bass_level * PARTICLE_BASS_SPEED
         )
 
-        self.distance += movement * dt * 30.0
+        self.distance += (
+            movement * dt * 30.0
+        )
 
-        # Rotate particles around the center.
+        # Particles rotate around the visualizer center.
         self.angle += (
-            self.base_speed * dt
+            self.base_speed
+            * dt
             * (1.0 + bass_level * 1.5)
         )
 
@@ -385,7 +432,7 @@ class Particle:
             min(self.width, self.height) * 0.52
         )
 
-        # Respawn particles once they leave the visual area.
+        # Respawn particles after they move off-screen.
         if self.distance > maximum_distance:
             self.distance = np.random.uniform(
                 5.0,
@@ -398,15 +445,16 @@ class Particle:
             )
 
     def draw(self, surface, center_x, center_y):
-        x = center_x + math.cos(
-            self.angle
-        ) * self.distance
+        x = (
+            center_x
+            + math.cos(self.angle) * self.distance
+        )
 
-        y = center_y + math.sin(
-            self.angle
-        ) * self.distance
+        y = (
+            center_y
+            + math.sin(self.angle) * self.distance
+        )
 
-        # Brighter particles are drawn slightly larger.
         color = (
             0,
             min(255, self.alpha),
@@ -422,7 +470,7 @@ class Particle:
 
 
 # ============================================================
-# BASS RING DRAWING
+# BASS RINGS
 # ============================================================
 
 def draw_bass_rings(
@@ -434,33 +482,35 @@ def draw_bass_rings(
     animation_time,
 ):
     """
-    Draw concentric rings that expand with bass.
+    Draw concentric bass rings.
 
-    Every ring receives its own traveling sine ripple.
-    Different phase offsets make the rings move independently
-    while remaining synchronized to the bass intensity.
+    Every ring expands with the bass level and receives its
+    own sine-wave ripple.
     """
 
     bass_level = float(
         np.clip(bass_level, 0.0, 1.0)
     )
 
-    # Overall expansion shared by all rings.
+    # Shared expansion, controlled by dampened bass.
     bass_expansion = (
         PULSE_STRENGTH * bass_level
     )
 
-    for ring_index in range(BASS_RING_COUNT):
-        # Each ring has a different base radius.
+    for ring_index in range(
+        BASS_RING_COUNT
+    ):
         ring_radius = (
             base_radius
             + ring_index * BASS_RING_SPACING
         )
 
-        # Offset the ripple phase for each concentric ring.
-        phase_offset = ring_index * 0.65
+        # Offset each ring's wave phase.
+        phase_offset = (
+            ring_index * 0.65
+        )
 
-        # Bass increases the strength of the sine distortion.
+        # Stronger bass creates larger sine ripples.
         ripple_strength = (
             BASS_RING_WAVE_AMOUNT
             * bass_level
@@ -475,14 +525,13 @@ def draw_bass_rings(
                 i / point_count
             ) * math.tau
 
-            # Traveling sine wave around the circle.
             ripple = math.sin(
                 angle * BASS_RING_WAVE_CYCLES
                 - animation_time * BASS_RING_WAVE_SPEED
                 + phase_offset
             )
 
-            # Apply the overall bass expansion and local ripple.
+            # Overall expansion plus local sine displacement.
             radius = (
                 ring_radius * (1.0 + bass_expansion)
                 + ripple * ripple_strength
@@ -502,7 +551,6 @@ def draw_bass_rings(
                 (int(x), int(y))
             )
 
-        # Fade outer rings slightly.
         brightness = max(
             70,
             220 - ring_index * 22,
@@ -514,18 +562,17 @@ def draw_bass_rings(
             min(100, brightness // 2),
         )
 
-        if len(points) >= 2:
-            pygame.draw.lines(
-                surface,
-                ring_color,
-                True,
-                points,
-                2 if ring_index < 3 else 1,
-            )
+        pygame.draw.lines(
+            surface,
+            ring_color,
+            True,
+            points,
+            2 if ring_index < 3 else 1,
+        )
 
 
 # ============================================================
-# TREBLE WAVE DRAWING
+# TREBLE WAVE
 # ============================================================
 
 def draw_treble_wave(
@@ -535,25 +582,21 @@ def draw_treble_wave(
     treble_level,
     animation_time,
 ):
-    """
-    Draw a sine wave across the screen.
-
-    The treble level controls the wave height.
-    """
+    """Draw two treble-responsive sine waves."""
 
     treble_level = float(
         np.clip(treble_level, 0.0, 1.0)
     )
 
+    # Primary wave amplitude.
     wave_height = (
         WAVE_AMPLITUDE * treble_level
     )
 
-    # Keep a small visible wave even when treble is quiet.
+    # Small baseline movement keeps the wave visible at silence.
     wave_height += 2.0
 
     points = []
-
     point_spacing = 4
 
     for x in range(
@@ -586,10 +629,12 @@ def draw_treble_wave(
             2,
         )
 
-    # Draw a softer secondary wave for extra depth.
+    # Secondary wave adds depth without overpowering the main.
     secondary_points = []
 
-    secondary_height = wave_height * 0.45
+    secondary_height = (
+        wave_height * 0.45
+    )
 
     for x in range(
         0,
@@ -637,7 +682,7 @@ def draw_meter(
     label,
     font,
 ):
-    """Draw a labeled horizontal audio-level meter."""
+    """Draw an audio meter and its current normalized value."""
 
     value = float(
         np.clip(value, 0.0, 1.0)
@@ -681,7 +726,7 @@ def draw_hud(
     treble_level,
     fullscreen,
 ):
-    """Draw the audio meters and keyboard controls."""
+    """Draw meters and keyboard controls."""
 
     draw_meter(
         surface,
@@ -729,33 +774,31 @@ def draw_hud(
 
 
 # ============================================================
-# DISPLAY MANAGEMENT
+# DISPLAY
 # ============================================================
 
 def create_display(fullscreen=True):
-    """Create either a fullscreen or windowed display."""
+    """Create the fullscreen or windowed display."""
 
     if fullscreen:
         info = pygame.display.Info()
 
-        screen = pygame.display.set_mode(
+        return pygame.display.set_mode(
             (
                 info.current_w,
                 info.current_h,
             ),
             pygame.FULLSCREEN,
         )
-    else:
-        screen = pygame.display.set_mode(
-            (1280, 720),
-            pygame.RESIZABLE,
-        )
 
-    return screen
+    return pygame.display.set_mode(
+        (1280, 720),
+        pygame.RESIZABLE,
+    )
 
 
 # ============================================================
-# MAIN PROGRAM
+# MAIN
 # ============================================================
 
 def main():
@@ -765,7 +808,7 @@ def main():
         "Audio Reactive Visualizer"
     )
 
-    # Start in fullscreen mode.
+    # Start fullscreen.
     fullscreen = True
 
     screen = create_display(
@@ -786,31 +829,27 @@ def main():
 
     show_hud = True
 
-    # Audio analysis object.
     analyzer = AudioAnalyzer()
 
-    # Create particles.
     particles = [
         Particle(width, height)
         for _ in range(PARTICLE_COUNT)
     ]
 
     # --------------------------------------------------------
-    # Choose the target application's process ID.
+    # TARGET PROCESS
     # --------------------------------------------------------
+    # Enter the PID of the application whose audio you want
+    # to capture. No microphone is used.
     #
-    # Set TARGET_PID to the PID of the application you want
-    # to capture. Do not use the visualizer's own PID.
-    #
-    # Example:
+    # To hard-code a PID, replace None with its integer:
     # TARGET_PID = 12345
-    #
-    # If TARGET_PID is None, the program asks for it at launch.
     # --------------------------------------------------------
 
     TARGET_PID = None
 
     if TARGET_PID is None:
+        # Temporarily close Pygame so the PID prompt is visible.
         pygame.quit()
 
         try:
@@ -819,10 +858,12 @@ def main():
                     "Enter the target application's PID: "
                 ).strip()
             )
+
         except (ValueError, EOFError):
             print("Invalid PID. Exiting.")
             return
 
+        # Reinitialize the fullscreen display.
         pygame.init()
 
         pygame.display.set_caption(
@@ -850,7 +891,6 @@ def main():
             for _ in range(PARTICLE_COUNT)
         ]
 
-    # Start capturing audio from the chosen process.
     tap = None
 
     try:
@@ -867,8 +907,7 @@ def main():
         tap.start()
 
         logger.info(
-            "Audio capture started. "
-            "Make sure the target application is playing audio."
+            "Audio capture started. Play audio in the target app."
         )
 
         last_log_time = time.monotonic()
@@ -878,11 +917,11 @@ def main():
         while running:
             dt = clock.tick(FPS) / 1000.0
 
-            # Limit very large time steps after window changes.
+            # Prevent huge updates after a display change.
             dt = min(dt, 0.05)
 
             # ------------------------------------------------
-            # HANDLE EVENTS
+            # EVENTS
             # ------------------------------------------------
 
             for event in pygame.event.get():
@@ -916,13 +955,20 @@ def main():
                     elif event.key == pygame.K_r:
                         analyzer.reset()
 
+                        # Clear queued stale audio as well.
+                        while True:
+                            try:
+                                audio_queue.get_nowait()
+                            except queue.Empty:
+                                break
+
                         for particle in particles:
                             particle.reset(
                                 random_position=True
                             )
 
             # ------------------------------------------------
-            # UPDATE AUDIO ANALYSIS
+            # AUDIO
             # ------------------------------------------------
 
             analyzer.update()
@@ -931,7 +977,7 @@ def main():
             treble_level = analyzer.treble
 
             # ------------------------------------------------
-            # UPDATE PARTICLES
+            # PARTICLE UPDATE
             # ------------------------------------------------
 
             for particle in particles:
@@ -944,7 +990,7 @@ def main():
                 )
 
             # ------------------------------------------------
-            # DRAW BACKGROUND
+            # DRAW
             # ------------------------------------------------
 
             screen.fill(
@@ -953,10 +999,7 @@ def main():
 
             animation_time = time.monotonic()
 
-            # ------------------------------------------------
-            # DRAW BASS RINGS
-            # ------------------------------------------------
-
+            # Concentric bass rings, each with sine ripples.
             draw_bass_rings(
                 screen,
                 center_x,
@@ -966,10 +1009,7 @@ def main():
                 animation_time=animation_time,
             )
 
-            # ------------------------------------------------
-            # DRAW TREBLE WAVE
-            # ------------------------------------------------
-
+            # Treble waveform.
             draw_treble_wave(
                 screen,
                 center_y,
@@ -978,10 +1018,7 @@ def main():
                 animation_time,
             )
 
-            # ------------------------------------------------
-            # DRAW PARTICLES
-            # ------------------------------------------------
-
+            # Bass-reactive particles.
             for particle in particles:
                 particle.draw(
                     screen,
@@ -989,10 +1026,7 @@ def main():
                     center_y,
                 )
 
-            # ------------------------------------------------
-            # DRAW CENTER DOT
-            # ------------------------------------------------
-
+            # Center dot expands with bass.
             center_radius = int(
                 5 + bass_level * 12
             )
@@ -1004,10 +1038,7 @@ def main():
                 center_radius,
             )
 
-            # ------------------------------------------------
-            # DRAW HUD
-            # ------------------------------------------------
-
+            # HUD and audio meters.
             if show_hud:
                 draw_hud(
                     screen,
@@ -1020,7 +1051,7 @@ def main():
             pygame.display.flip()
 
             # ------------------------------------------------
-            # DIAGNOSTIC LOGGING
+            # DIAGNOSTICS
             # ------------------------------------------------
 
             now = time.monotonic()
@@ -1028,8 +1059,8 @@ def main():
             if now - last_log_time >= LOG_INTERVAL:
                 logger.info(
                     "Audio diagnostics | "
-                    "callbacks=%s | callback_frames=%s | "
-                    "bytes=%s | peak=%.6f | RMS=%.6f | "
+                    "callbacks=%s | frames=%s | bytes=%s | "
+                    "peak=%.6f | RMS=%.6f | "
                     "raw_bass=%.6f | raw_treble=%.6f | "
                     "bass=%.3f | treble=%.3f",
                     audio_diagnostics["callbacks"],
@@ -1057,7 +1088,6 @@ def main():
         )
 
     finally:
-        # Stop capture before shutting down Pygame.
         if tap is not None:
             try:
                 tap.close()
